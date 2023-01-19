@@ -1,0 +1,605 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Athena report
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 256
+    Runtime: python3.8
+  Api:
+    Cors:
+      AllowMethods: "'*'"
+      AllowHeaders: "'*'"
+      AllowOrigin: "'*'"
+
+Resources:
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+
+  ReportsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportsBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - 's3:GetBucketAcl'
+              - 's3:GetBucketPolicy'
+            Resource: !Sub "arn:aws:s3:::${ReportsBucket}"
+          - Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - 's3:PutObject'
+            Resource: !Sub "arn:aws:s3:::${ReportsBucket}/*"        
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaKinesisExecutionRole
+      Policies:
+        -
+          PolicyName: s3Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListMultipartUploadParts
+                  - s3:AbortMultipartUpload
+                Resource: 
+                  - !GetAtt ReportsBucket.Arn
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ReportsBucket}/*'
+        -
+          PolicyName: AthenaAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'athena:StartQueryExecution'
+                  - 'athena:GetQueryExecution'
+                  - 'athena:StopQueryExecution'
+                  - 'athena:GetQueryResults'
+                Resource:
+                  - '*'
+        -
+          PolicyName: GlueAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'glue:GetTable'
+                  - 'glue:GetDatabase'
+                  - 'glue:GetPartition'
+                Resource:
+                  - '*'
+        -
+          PolicyName: KMSAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:*'
+                Resource:
+                  - '*'
+  CURReport:
+    Type: AWS::CUR::ReportDefinition
+    DependsOn: ReportsBucketPolicy
+    Properties: 
+      Compression: 'Parquet'
+      Format: 'Parquet'
+      RefreshClosedReports: True
+      ReportName: !Join ['_', ['cur', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      ReportVersioning: 'OVERWRITE_REPORT'
+      S3Bucket: !Ref ReportsBucket
+      S3Prefix: 'reports'
+      S3Region: !Ref "AWS::Region"
+      TimeUnit: 'HOURLY'
+
+  AWSCURDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      DatabaseInput:
+        Description: 'CUR Database'
+        Name: !Join ['_', ['cur_db', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      CatalogId: !Ref AWS::AccountId
+
+  AWSCURCrawlerComponentFunction:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: AWSCURCrawlerComponentFunction
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'glue:UpdateDatabase'
+                  - 'glue:UpdatePartition'
+                  - 'glue:CreateTable'
+                  - 'glue:UpdateTable'
+                  - 'glue:ImportCatalogToGlue'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ReportsBucket}/*'
+        - PolicyName: AWSCURKMSDecryption
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                Resource: '*'
+       
+  CrawlerLFPermissions:
+    Type: AWS::LakeFormation::Permissions
+    Properties: 
+      DataLakePrincipal: 
+        DataLakePrincipalIdentifier: !GetAtt AWSCURCrawlerComponentFunction.Arn
+      Permissions: 
+        - "ALL"
+      PermissionsWithGrantOption:
+       - "ALL"
+      Resource: 
+        DatabaseResource: 
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref AWSCURDatabase
+          
+
+  LambdaLFPermissions:
+    Type: AWS::LakeFormation::Permissions
+    Properties: 
+      DataLakePrincipal: 
+        DataLakePrincipalIdentifier: !GetAtt LambdaRole.Arn
+      Permissions: 
+        - "ALL"
+      PermissionsWithGrantOption:
+       - "ALL"
+      Resource:
+        TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref AWSCURDatabase
+          TableWildcard: {}
+
+
+  AWSCURCrawlerLambdaExecutor:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AWSCURCrawlerLambdaExecutor
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'glue:StartCrawler'
+                Resource: '*'
+       
+
+  AWSCURCrawler:
+    Type: 'AWS::Glue::Crawler'
+    DependsOn:
+      - AWSCURDatabase
+      - AWSCURCrawlerComponentFunction
+    Properties:
+      Name: !Join ['-', ['CUR-ReportCrawler', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      Description: A recurring crawler that keeps your CUR table in Athena up-to-date.
+      Role: !GetAtt AWSCURCrawlerComponentFunction.Arn
+      DatabaseName: !Ref AWSCURDatabase
+      Targets:
+        S3Targets:
+          - Path: !Join ['', [!Sub 's3://${ReportsBucket}/reports/', !Ref CURReport, '/', !Ref CURReport]]
+            Exclusions:
+              - '**.json'
+              - '**.yml'
+              - '**.sql'
+              - '**.csv'
+              - '**.gz'
+              - '**.zip'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DELETE_FROM_DATABASE
+
+  AWSCURInitializer:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: AWSCURCrawler
+    Properties:
+      Code:
+        ZipFile: >
+          const AWS = require('aws-sdk');
+          const response = require('./cfn-response');
+          let CRAWLER_NAME = process.env.CRAWLER_NAME;
+          exports.handler = function(event, context, callback) {
+            if (event.RequestType === 'Delete') {
+              response.send(event, context, response.SUCCESS);
+            } else {
+              const glue = new AWS.Glue();
+              glue.startCrawler({ Name: CRAWLER_NAME }, function(err, data) {
+                if (err) {
+                  const responseData = JSON.parse(this.httpResponse.body);
+                  if (responseData['__type'] == 'CrawlerRunningException') {
+                    callback(null, responseData.Message);
+                  } else {
+                    const responseString = JSON.stringify(responseData);
+                    if (event.ResponseURL) {
+                      response.send(event, context, response.FAILED,{ msg: responseString });
+                    } else {
+                      callback(responseString);
+                    }
+                  }
+                }
+                else {
+                  if (event.ResponseURL) {
+                    response.send(event, context, response.SUCCESS);
+                  } else {
+                    callback(null, response.SUCCESS);
+                  }
+                }
+              });
+            }
+          };
+      Handler: 'index.handler'
+      Timeout: 30
+      Runtime: nodejs16.x
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt AWSCURCrawlerLambdaExecutor.Arn
+      Environment:
+        Variables:
+          CRAWLER_NAME: !Ref AWSCURCrawler
+     
+
+  AWSStartCURCrawler:
+    Type: 'Custom::AWSStartCURCrawler'
+    Properties:
+      ServiceToken: !GetAtt AWSCURInitializer.Arn
+     
+
+  AWSS3CUREventLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt AWSCURInitializer.Arn
+      Principal: 's3.amazonaws.com'
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt ReportsBucket.Arn
+     
+
+  AWSS3CURLambdaExecutor:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AWSS3CURLambdaExecutor
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 's3:PutBucketNotification'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ReportsBucket}'
+       
+
+  AWSS3CURNotification:
+    Type: 'AWS::Lambda::Function'
+    DependsOn:
+    - AWSCURInitializer
+    - AWSS3CUREventLambdaPermission
+    - AWSS3CURLambdaExecutor
+    Properties:
+      Code:
+        ZipFile: >
+          const AWS = require('aws-sdk');
+          const response = require('./cfn-response');
+          exports.handler = function(event, context, callback) {
+            const s3 = new AWS.S3();
+            const putConfigRequest = function(notificationConfiguration) {
+              return new Promise(function(resolve, reject) {
+                s3.putBucketNotificationConfiguration({
+                  Bucket: event.ResourceProperties.BucketName,
+                  NotificationConfiguration: notificationConfiguration
+                }, function(err, data) {
+                  if (err) reject({ msg: this.httpResponse.body.toString(), error: err, data: data });
+                  else resolve(data);
+                });
+              });
+            };
+            const newNotificationConfig = {};
+            if (event.RequestType !== 'Delete') {
+              newNotificationConfig.LambdaFunctionConfigurations = [{
+                Events: [ 's3:ObjectCreated:*' ],
+                LambdaFunctionArn: event.ResourceProperties.TargetLambdaArn || 'missing arn',
+                Filter: { Key: { FilterRules: [ { Name: 'prefix', Value: event.ResourceProperties.ReportKey } ] } }
+              }];
+            }
+            putConfigRequest(newNotificationConfig).then(function(result) {
+              response.send(event, context, response.SUCCESS, result);
+              callback(null, result);
+            }).catch(function(error) {
+              response.send(event, context, response.FAILED, error);
+              console.log(error);
+              callback(error);
+            });
+          };
+      Handler: 'index.handler'
+      Timeout: 30
+      Runtime: nodejs16.x
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt AWSS3CURLambdaExecutor.Arn
+     
+
+  AWSPutS3CURNotification:
+    Type: 'Custom::AWSPutS3CURNotification'
+    Properties:
+      ServiceToken: !GetAtt AWSS3CURNotification.Arn
+      TargetLambdaArn: !GetAtt AWSCURInitializer.Arn
+      BucketName: !Ref ReportsBucket
+      ReportKey: !Sub 'reports/${CURReport}/${CURReport}'
+
+  AWSCURReportStatusTable:
+    Type: 'AWS::Glue::Table'
+    DependsOn: AWSCURDatabase
+    Properties:
+      DatabaseName: !Ref AWSCURDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: 'cost_and_usage_data_status'
+        TableType: 'EXTERNAL_TABLE'
+        StorageDescriptor:
+          Columns:
+            - Name: status
+              Type: 'string'
+          InputFormat: 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
+          OutputFormat: 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
+          SerdeInfo:
+            SerializationLibrary: 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
+          Location: !Sub 's3://${ReportsBucket}/athena/cost_and_usage_data_status/'
+
+  accessAPI:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Join 
+        - ''
+        - - !Ref 'AWS::StackName'
+          - '-accessAPI'
+      Description: API used for sending messages from external services.
+      FailOnWarnings: true
+
+  LambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:invokeFunction'
+      FunctionName: !GetAtt 
+        - AthenaBillingFunction
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join 
+        - ''
+        - - 'arn:aws:execute-api:'
+          - !Ref 'AWS::Region'
+          - ':'
+          - !Ref 'AWS::AccountId'
+          - ':'
+          - !Ref accessAPI
+          - /*
+
+  ApiGatewayCloudWatchLogsRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: ApiGatewayLogsPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:PutLogEvents'
+                  - 'logs:GetLogEvents'
+                  - 'logs:FilterLogEvents'
+                Resource: '*'
+  ApiGatewayAccount:
+    Type: 'AWS::ApiGateway::Account'
+    Properties:
+      CloudWatchRoleArn: !GetAtt 
+        - ApiGatewayCloudWatchLogsRole
+        - Arn
+  ApiStage:
+    DependsOn:
+      - ApiGatewayAccount
+      - TestMethod
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      MethodSettings:
+        - DataTraceEnabled: true
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          ResourcePath: /*
+      RestApiId: !Ref accessAPI
+      StageName: Prod
+  
+  ApiDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      - TestMethod
+      - APIResource
+    Properties:
+      RestApiId: !Ref accessAPI
+      StageName: Dev
+
+  APIResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref accessAPI
+      ParentId: !GetAtt 
+        - accessAPI
+        - RootResourceId
+      PathPart: test
+      
+  TestMethod:
+    DependsOn: LambdaPermission
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Join 
+          - ''
+          - - 'arn:aws:apigateway:'
+            - !Ref 'AWS::Region'
+            - ':lambda:path/2015-03-31/functions/'
+            - !GetAtt 
+              - AthenaBillingFunction
+              - Arn
+            - /invocations
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: !Join 
+                - ''
+                - - "{\n"
+                  - "  \"body-json\": $input.json('$')\n"
+                  - "}\n"              
+              
+        PassthroughBehavior: 'WHEN_NO_TEMPLATES'
+        RequestTemplates:
+          application/json: !Join 
+            - ""
+            - - "#set($inputRoot = $input.path('$'))\n"
+              - "{\n"
+              - "\"AccountID\": \"$input.params('AccountID')\",\n"
+              - "\"Month\": \"$input.params('Month')\",\n"
+              - "\"Year\": \"$input.params('Year')\"\n"
+              - "}"
+      RequestParameters:
+        method.request.querystring.AccountID: true
+        method.request.querystring.Month: true
+        method.request.querystring.Year: true
+      ResourceId: !Ref APIResource
+      RestApiId: !Ref accessAPI
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+      RequestValidatorId: !Ref APIRequestValidator
+
+  APIRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties: 
+      Name: "Body-Params"
+      RestApiId: !Ref accessAPI
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  AthenaBillingFunction:
+    Type: AWS::Serverless::Function 
+    Properties:
+      Role: !GetAtt LambdaRole.Arn
+      CodeUri: athena-billing/
+      Handler: lambda_function.lambda_handler
+      Environment:
+        Variables:
+          DATABASE: !Ref AWSCURDatabase
+          REPORTS_BUCKET: !Ref ReportsBucket
+          TABLE: !Ref CURReport
+
+
+Outputs:
+  ReportsBucket:
+    Description: "Bucket for List Loading and Results generation"
+    Value: !Ref ReportsBucket 
